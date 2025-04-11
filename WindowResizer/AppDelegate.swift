@@ -7,12 +7,69 @@
 
 import Cocoa
 import SwiftUI
+import ServiceManagement
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
-    let windowObserver = WindowObserver()
+    var windowObserver: WindowObserver!
     var userExplicitlyStopped = false
     
+    // Default list of apps to ignore
+    var ignoredApps = ["Finder", "Terminal", "System Settings", "System Preferences"]
+    
+    // Launch at login setting
+    var launchAtLogin: Bool {
+        get {
+            return UserDefaults.standard.bool(forKey: "launchAtLogin")
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: "launchAtLogin")
+            updateLoginItemSettings()
+        }
+    }
+    
+    override init() {
+        super.init()
+        
+        // Load saved ignored apps list if available
+        if let savedApps = UserDefaults.standard.stringArray(forKey: "ignoredApps") {
+            ignoredApps = savedApps
+            print("Loaded saved ignored apps: \(ignoredApps.joined(separator: ", "))")
+        }
+        
+        windowObserver = WindowObserver(ignoredApps: ignoredApps)
+    }
+    func updateLoginItemSettings() {
+        // Get the app's bundle identifier
+        if let bundleIdentifier = Bundle.main.bundleIdentifier {
+            // Try using modern API first (macOS 13+)
+            if #available(macOS 13.0, *) {
+                do {
+                    try SMAppService.mainApp.register()
+                    print("Registered app to launch at login using SMAppService")
+                } catch {
+                    print("Failed to register app to launch at login: \(error)")
+                    // Fall back to legacy method
+                    setLaunchAtLoginLegacy(bundleIdentifier: bundleIdentifier)
+                }
+            } else {
+                // Use legacy method for older macOS versions
+                setLaunchAtLoginLegacy(bundleIdentifier: bundleIdentifier)
+            }
+        } else {
+            print("Could not determine bundle identifier")
+        }
+    }
+    
+    func setLaunchAtLoginLegacy(bundleIdentifier: String) {
+        // Legacy method using SMLoginItemSetEnabled
+        if SMLoginItemSetEnabled(bundleIdentifier as CFString, launchAtLogin) {
+            print("Successfully \(launchAtLogin ? "enabled" : "disabled") launch at login")
+        } else {
+            print("Failed to \(launchAtLogin ? "enable" : "disable") launch at login")
+        }
+    }
+            
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenuBar()
         
@@ -36,6 +93,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         // Set up timer to regularly check permission status
         Timer.scheduledTimer(timeInterval: 1.0, target: self, selector: #selector(checkPermissionStatus), userInfo: nil, repeats: true)
+        
+        // Check current login item status
+        if launchAtLogin {
+            print("App is set to launch at login")
+        }
     }
     
     @objc func checkPermissionStatus() {
@@ -99,6 +161,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(stopMenuItem)
             
             menu.addItem(NSMenuItem(title: "Force Resize Current Window", action: #selector(forceResizeCurrent), keyEquivalent: "r"))
+            
+            // Add Manage Ignored Apps option
+            menu.addItem(NSMenuItem.separator())
+            menu.addItem(NSMenuItem(title: "Manage Ignored Apps", action: #selector(manageIgnoredApps), keyEquivalent: "i"))
+            
+            // Add Launch at Login option
+            let launchAtLoginItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "l")
+            launchAtLoginItem.state = launchAtLogin ? .on : .off
+            menu.addItem(launchAtLoginItem)
         } else {
             statusMenuItem.title = "⚠️ Request Accessibility Permission"
             statusMenuItem.action = #selector(requestPermission)
@@ -168,6 +239,46 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         windowObserver.resizeCurrentWindow()
     }
     
+    @objc func manageIgnoredApps() {
+        let alert = NSAlert()
+        alert.messageText = "Manage Ignored Apps"
+        alert.informativeText = "Enter app names to ignore, separated by commas (e.g., 'Finder, Terminal'):\n\nCurrent ignored apps: \(ignoredApps.joined(separator: ", "))"
+        
+        let inputTextField = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        inputTextField.stringValue = ignoredApps.joined(separator: ", ")
+        alert.accessoryView = inputTextField
+        
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+        
+        let response = alert.runModal()
+        
+        if response == .alertFirstButtonReturn {
+            let newIgnoredAppsString = inputTextField.stringValue
+            let newIgnoredApps = newIgnoredAppsString.split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            
+            // Update the ignored apps list
+            ignoredApps = newIgnoredApps
+            windowObserver.ignoredApps = newIgnoredApps
+            
+            // Save to UserDefaults
+            UserDefaults.standard.set(newIgnoredApps, forKey: "ignoredApps")
+            
+            print("Updated ignored apps list: \(ignoredApps.joined(separator: ", "))")
+        }
+    }
+    
+    @objc func toggleLaunchAtLogin() {
+        // Toggle the launch at login setting
+        launchAtLogin = !launchAtLogin
+        print("Launch at login \(launchAtLogin ? "enabled" : "disabled")")
+        
+        // Update the menu to reflect the new setting
+        updateMenu()
+    }
+    
     @objc func quitApp() {
         NSApp.terminate(nil)
     }
@@ -175,6 +286,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
 class WindowObserver {
     var isMonitoring: Bool = false
+    var ignoredApps: [String]
+    
+    init(ignoredApps: [String]) {
+        self.ignoredApps = ignoredApps
+    }
     
     func startMonitoring() {
         guard !isMonitoring else { return } // Don't register multiple times
@@ -233,10 +349,12 @@ class WindowObserver {
         let appName = frontmostApp.localizedName ?? "Unknown"
         print("Current window is from: \(appName)")
         
-        // Skip system apps that we don't want to resize
-        let systemApps = ["Finder", "SystemUIServer", "Control Center", "NotificationCenter", "Window Manager", "Dock"]
-        if systemApps.contains(where: { appName.contains($0) }) {
-            print("Skipping system app: \(appName)")
+        // Skip system apps and explicitly ignored apps
+        let systemApps = ["SystemUIServer", "Control Center", "NotificationCenter", "Window Manager", "Dock"]
+        let allIgnoredApps = systemApps + ignoredApps
+        
+        if allIgnoredApps.contains(where: { appName.contains($0) }) {
+            print("Skipping ignored app: \(appName)")
             return
         }
         
@@ -254,6 +372,14 @@ class WindowObserver {
         
         // Get the window element
         let windowElement = windowRef as! AXUIElement
+        
+        // Check if the window is resizable
+        var isResizableRef: AnyObject?
+        if AXUIElementCopyAttributeValue(windowElement, "AXResizable" as CFString, &isResizableRef) == .success,
+           let isResizable = isResizableRef as? Bool, !isResizable {
+            print("Window is not resizable. Skipping.")
+            return
+        }
         
         // Get current position and size
         let (currentPosition, currentSize) = getCurrentPositionAndSize(windowElement)
